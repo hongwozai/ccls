@@ -12,7 +12,9 @@
 #include "working_files.h"
 using namespace ccls;
 
-#include <clang/Driver/Options.h>
+#include <clang/Driver/Compilation.h>
+#include <clang/Driver/Driver.h>
+#include <clang/Frontend/CompilerInstance.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/Option/ArgList.h>
 #include <llvm/Option/OptTable.h>
@@ -97,25 +99,54 @@ Project::Entry GetCompilationEntryFromCompileCommandEntry(
   args.insert(args.end(), config->extra_flags.begin(),
               config->extra_flags.end());
 
-  std::unique_ptr<OptTable> Opts = driver::createDriverOptTable();
-  unsigned MissingArgIndex, MissingArgCount;
+
+  IgnoringDiagConsumer DiagC;
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts(new DiagnosticOptions());
+  DiagnosticsEngine Diags(
+      IntrusiveRefCntPtr<DiagnosticIDs>(new DiagnosticIDs()), &*DiagOpts,
+      &DiagC, false);
+
+  driver::Driver Driver(args[0], llvm::sys::getDefaultTargetTriple(), Diags);
+  auto TargetAndMode =
+      driver::ToolChain::getTargetAndModeFromProgramName(args[0]);
+  if (!TargetAndMode.TargetPrefix.empty()) {
+    const char* arr[] = {"-target", TargetAndMode.TargetPrefix.c_str()};
+    args.insert(args.begin() + 1, std::begin(arr), std::end(arr));
+    Driver.setTargetAndMode(TargetAndMode);
+  }
+  Driver.setCheckInputsExist(false);
+
   std::vector<const char*> cargs;
   for (auto& arg : args)
     cargs.push_back(arg.c_str());
-  InputArgList Args =
-      Opts->ParseArgs(makeArrayRef(cargs), MissingArgIndex, MissingArgCount,
-                      driver::options::CC1Option);
+  cargs.push_back("-fsyntax-only");
+  std::unique_ptr<driver::Compilation> C(Driver.BuildCompilation(cargs));
+  const driver::JobList& Jobs = C->getJobs();
+  if (Jobs.size() != 1)
+    return result;
+  const driver::ArgStringList& CCArgs = Jobs.begin()->getArguments();
 
-  using namespace clang::driver::options;
-  for (const auto* A :
-       Args.filtered(OPT_I, OPT_c_isystem, OPT_cxx_isystem, OPT_isystem))
-    config->angle_dirs.insert(entry.ResolveIfRelative(A->getValue()));
-  for (const auto* A : Args.filtered(OPT_I, OPT_iquote))
-    config->quote_dirs.insert(entry.ResolveIfRelative(A->getValue()));
-  for (const auto* A : Args.filtered(OPT_idirafter)) {
-    std::string dir = entry.ResolveIfRelative(A->getValue());
-    config->angle_dirs.insert(dir);
-    config->quote_dirs.insert(dir);
+  auto Invocation = std::make_unique<CompilerInvocation>();
+  CompilerInvocation::CreateFromArgs(*Invocation, CCArgs.data(),
+                                     CCArgs.data() + CCArgs.size(), Diags);
+  Invocation->getFrontendOpts().DisableFree = false;
+  Invocation->getCodeGenOpts().DisableFree = false;
+
+  HeaderSearchOptions& HeaderOpts = Invocation->getHeaderSearchOpts();
+  for (auto& E : HeaderOpts.UserEntries) {
+    std::string path = entry.ResolveIfRelative(E.Path);
+    switch (E.Group) {
+      default:
+        config->angle_dirs.insert(path);
+        break;
+      case frontend::Quoted:
+        config->quote_dirs.insert(path);
+        break;
+      case frontend::Angled:
+        config->angle_dirs.insert(path);
+        config->quote_dirs.insert(path);
+        break;
+    }
   }
 
   for (size_t i = 1; i < args.size(); i++)
@@ -128,9 +159,9 @@ Project::Entry GetCompilationEntryFromCompileCommandEntry(
       continue;
     }
 
-  if (!Args.hasArg(OPT_resource_dir))
+  if (HeaderOpts.ResourceDir.empty() && HeaderOpts.UseBuiltinIncludes)
     args.push_back("-resource-dir=" + g_config->clang.resourceDir);
-  if (!Args.hasArg(OPT_working_directory))
+  if (Invocation->getFileSystemOpts().WorkingDir.empty())
     args.push_back("-working-directory=" + entry.directory);
 
   // There could be a clang version mismatch between what the project uses and
